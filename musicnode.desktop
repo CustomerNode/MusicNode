@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MusicNode
+Comment=Minimal music & video player with queue, AirPlay, and lock-screen controls
+Exec=musicnode
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Audio;Video;Player;
+Keywords=music;video;queue;audio;player;mp4;airplay;
+StartupNotify=true
