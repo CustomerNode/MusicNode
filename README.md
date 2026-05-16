@@ -6,7 +6,7 @@ A minimal music + video player for Linux desktops. Drop files in, queue them up,
 
 ## Features
 
-- **Queue-first workflow.** Drag tracks in, drag rows to reorder, click `✕` on a row to remove it.
+- **Queue-first workflow.** Drag tracks in, drag rows to reorder, click `✕` on a row to remove it. One-click **🔀 Shuffle folder** dumps a whole directory tree in random order.
 - **Plays everything GStreamer plays.** mp3, m4a, flac, ogg, wav, opus, mp4, mkv, webm, mov, …
 - **Inline video.** Hardware-accelerated video pane (gtkglsink) with full-screen and a "hide controls" cinema mode for in-window watching.
 - **AirPlay (legacy RAOP).** Send audio to AirPort Express, Onkyo / Denon receivers, and other classic AirPlay devices via PipeWire's `module-raop-discover`.

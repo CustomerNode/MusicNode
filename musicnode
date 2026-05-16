@@ -8,6 +8,7 @@ files just play with no video frame.
 """
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -245,6 +246,12 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.add_folder_btn.connect("clicked", self.on_add_folder_clicked)
         add_row.pack_start(self.add_folder_btn, True, True, 0)
 
+        self.shuffle_folder_btn = Gtk.Button(label="🔀 Shuffle folder")
+        self.shuffle_folder_btn.set_tooltip_text(
+            "Add every media file in this folder (and subfolders) in random order")
+        self.shuffle_folder_btn.connect("clicked", self.on_shuffle_folder_clicked)
+        add_row.pack_start(self.shuffle_folder_btn, True, True, 0)
+
         left.pack_start(add_row, False, False, 0)
         hpaned.pack1(left, True, False)
 
@@ -295,6 +302,7 @@ class MusicPlayer(Gtk.ApplicationWindow):
             ("↑ Up", "Move selected track up", self.on_queue_up),
             ("↓ Down", "Move selected track down", self.on_queue_down),
             ("✕ Remove", "Remove selected track (Delete)", self.on_queue_remove),
+            ("🔀 Shuffle", "Randomize the order of the queue", self.on_shuffle_queue),
             ("Clear", "Clear the whole queue", self.on_queue_clear),
         ]:
             b = Gtk.Button(label=label)
@@ -844,7 +852,7 @@ class MusicPlayer(Gtk.ApplicationWindow):
         out.sort(key=lambda p: str(p).lower())
         return out
 
-    def on_add_folder_clicked(self, _btn):
+    def _add_folder_to_queue(self, shuffle: bool):
         # Determine which folders to add. If folder rows are selected in the
         # file list, use those. Otherwise add whatever's in the current_dir.
         sel = self.files_view.get_selection()
@@ -863,13 +871,38 @@ class MusicPlayer(Gtk.ApplicationWindow):
             self._toast("No media files found in that folder")
             return
 
+        if shuffle:
+            random.shuffle(all_media)
+
         was_empty = self.current_index == -1
         start_at = len(self.queue_paths)
         self.queue_paths.extend(all_media)
         self.refresh_queue_view()
         if was_empty:
             self.play_index(start_at)
-        self._toast(f"added {len(all_media)} file{'s' if len(all_media) != 1 else ''} to queue")
+        verb = "shuffled" if shuffle else "added"
+        n = len(all_media)
+        self._toast(f"{verb} {n} file{'s' if n != 1 else ''} to queue")
+
+    def on_add_folder_clicked(self, _btn):
+        self._add_folder_to_queue(shuffle=False)
+
+    def on_shuffle_folder_clicked(self, _btn):
+        self._add_folder_to_queue(shuffle=True)
+
+    def on_shuffle_queue(self, _btn):
+        if not self.queue_paths:
+            return
+        playing = (self.queue_paths[self.current_index]
+                   if 0 <= self.current_index < len(self.queue_paths) else None)
+        random.shuffle(self.queue_paths)
+        if playing is not None:
+            try:
+                self.current_index = self.queue_paths.index(playing)
+            except ValueError:
+                pass
+        self.refresh_queue_view()
+        self._toast(f"shuffled {len(self.queue_paths)} tracks")
 
     def on_queue_activated(self, _view, path, _col):
         self.play_index(path.get_indices()[0])
