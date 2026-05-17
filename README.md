@@ -8,6 +8,7 @@ A minimal music + video player for Linux desktops. Drop files in, queue them up,
 
 - **Queue-first workflow.** Drag tracks in, drag rows to reorder, click `✕` on a row to remove it. Add to the **top** (plays next) or **bottom** of the queue. One-click **🔀 Shuffle folder** dumps a whole directory tree in random order.
 - **Recursive search** scoped to the current folder. Type to filter across every track in the subtree you're sitting in, then add hits to the top or bottom of the queue. `Ctrl+F` to focus, `Esc` to clear.
+- **Saved playlists.** A 📋 Playlists entry at the music root lists every named playlist you've saved. One click on **💾 Save queue → playlist…** turns the current queue into an M3U file under `~/.config/musicnode/playlists/`. Each playlist behaves like a folder — click in to view tracks, hit "Add whole folder ▶" to queue the lot.
 - **Plays everything GStreamer plays.** mp3, m4a, flac, ogg, wav, opus, mp4, mkv, webm, mov, …
 - **Inline video.** Hardware-accelerated video pane (gtkglsink) with full-screen and a "hide controls" cinema mode for in-window watching.
 - **AirPlay (legacy RAOP).** Send audio to AirPort Express, Onkyo / Denon receivers, and other classic AirPlay devices via PipeWire's `module-raop-discover`.

@@ -36,6 +36,7 @@ Gst.init(None)
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "musicnode"
 STATE_PATH = CONFIG_DIR / "state.json"
+PLAYLISTS_DIR = CONFIG_DIR / "playlists"
 DEFAULT_FOLDER = Path.home() / "Music"
 MEDIA_EXTS = {
     # video
@@ -91,6 +92,13 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.load_state()
         # current_dir = where the file browser is currently looking. Starts at root.
         self.current_dir: Path = self.folder
+        # Playlist browsing state. Modes:
+        #   "files"          — normal folder view (uses current_dir)
+        #   "playlist-list"  — showing all saved playlists
+        #   "playlist"       — showing tracks of self._playlist_view
+        self._view_mode = "files"
+        self._playlist_view: str | None = None
+        PLAYLISTS_DIR.mkdir(parents=True, exist_ok=True)
 
         # Player
         self.player = Gst.ElementFactory.make("playbin", "player")
@@ -352,6 +360,14 @@ class MusicPlayer(Gtk.ApplicationWindow):
             b.connect("clicked", cb)
             qbtns.pack_start(b, True, True, 0)
         right.pack_start(qbtns, False, False, 0)
+
+        save_pl_btn = Gtk.Button(label="💾 Save queue → playlist…")
+        save_pl_btn.set_tooltip_text(
+            "Save the current queue as a named playlist (M3U file under "
+            "~/.config/musicnode/playlists/)")
+        save_pl_btn.connect("clicked", self.on_save_queue_as_playlist)
+        right.pack_start(save_pl_btn, False, False, 0)
+
         hpaned.pack2(right, True, False)
 
         # Transport
@@ -696,7 +712,54 @@ class MusicPlayer(Gtk.ApplicationWindow):
         return False
 
     # --- file list --------------------------------------------------------
+    # --- playlist storage ------------------------------------------------
+    def _safe_pl_name(self, name: str) -> str:
+        bad = '/\\:*?"<>|'
+        cleaned = "".join(c for c in name if c not in bad).strip()
+        return cleaned[:100] or "untitled"
+
+    def _all_playlists(self) -> list[str]:
+        if not PLAYLISTS_DIR.exists():
+            return []
+        return sorted(p.stem for p in PLAYLISTS_DIR.glob("*.m3u"))
+
+    def _playlist_tracks(self, name: str) -> list[Path]:
+        f = PLAYLISTS_DIR / f"{name}.m3u"
+        if not f.exists():
+            return []
+        out: list[Path] = []
+        for line in f.read_text(errors="replace").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                p = Path(s)
+                if p.exists():
+                    out.append(p)
+        return out
+
+    def _write_playlist(self, name: str, paths: list[Path]):
+        PLAYLISTS_DIR.mkdir(parents=True, exist_ok=True)
+        f = PLAYLISTS_DIR / f"{self._safe_pl_name(name)}.m3u"
+        lines = ["#EXTM3U"]
+        lines.extend(str(p) for p in paths)
+        f.write_text("\n".join(lines) + "\n")
+
+    def _delete_playlist(self, name: str) -> bool:
+        f = PLAYLISTS_DIR / f"{name}.m3u"
+        if not f.exists():
+            return False
+        f.unlink()
+        return True
+
+    # --- view dispatcher --------------------------------------------------
     def reload_files(self):
+        if self._view_mode == "playlist-list":
+            self._reload_playlist_list()
+        elif self._view_mode == "playlist":
+            self._reload_playlist_tracks()
+        else:
+            self._reload_file_view()
+
+    def _reload_file_view(self):
         if not self.folder.exists():
             self.files_store.clear()
             self.folder_label.set_text(f"{self.folder} (missing)")
@@ -727,8 +790,14 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.files_view.set_model(None)
         try:
             self.files_store.clear()
-            if self.current_dir.resolve() != self.folder.resolve():
+            at_root = self.current_dir.resolve() == self.folder.resolve()
+            if not at_root:
                 self.files_store.append(["⬆  ..", str(self.current_dir.parent), True, True])
+            # Pin "📋 Playlists" at the top when sitting at music root
+            if at_root:
+                n_pl = len(self._all_playlists())
+                self.files_store.append(
+                    [f"📋  Playlists  ({n_pl})", "_playlists", True, False])
             for display, p in folders:
                 self.files_store.append([display, str(p), True, False])
             for display, p in files:
@@ -746,6 +815,48 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.path_label.set_text(crumb)
         self.folder_label.set_text(
             f"{self.folder}   ({len(files)} files, {len(folders)} folders here)")
+
+    def _reload_playlist_list(self):
+        names = self._all_playlists()
+        self.files_view.freeze_child_notify()
+        self.files_view.set_model(None)
+        try:
+            self.files_store.clear()
+            self.files_store.append(["⬆  back to files", "_back-to-files", True, True])
+            for n in names:
+                count = len(self._playlist_tracks(n))
+                self.files_store.append(
+                    [f"📋  {n}   ({count} tracks)", f"_playlist:{n}", True, False])
+            if not names:
+                self.files_store.append(
+                    ["(no playlists yet — use 💾 Save queue → playlist)",
+                     "_noop", False, False])
+        finally:
+            self.files_view.set_model(self.files_store)
+            self.files_view.thaw_child_notify()
+        self.path_label.set_text("📋 Playlists")
+        self.folder_label.set_text(f"saved playlists: {len(names)}")
+        self.add_folder_btn.set_sensitive(False)
+        self.shuffle_folder_btn.set_sensitive(False)
+
+    def _reload_playlist_tracks(self):
+        name = self._playlist_view or ""
+        tracks = self._playlist_tracks(name)
+        self.files_view.freeze_child_notify()
+        self.files_view.set_model(None)
+        try:
+            self.files_store.clear()
+            self.files_store.append(["⬆  back to playlists", "_back-to-playlists", True, True])
+            for p in tracks:
+                self.files_store.append([f"🎵  {p.stem}", str(p), False, False])
+        finally:
+            self.files_view.set_model(self.files_store)
+            self.files_view.thaw_child_notify()
+        self.path_label.set_text(f"📋 / {name}")
+        self.folder_label.set_text(f"playlist: {name} ({len(tracks)} tracks)")
+        # In playlist mode, folder buttons turn into "queue the playlist"
+        self.add_folder_btn.set_sensitive(True)
+        self.shuffle_folder_btn.set_sensitive(True)
 
     # --- drag and drop ----------------------------------------------------
     def _unique_dest(self, dest: Path) -> Path:
@@ -846,8 +957,34 @@ class MusicPlayer(Gtk.ApplicationWindow):
     def on_file_activated(self, _view, path, _col):
         row = self.files_store[path]
         target_path, is_folder, _is_up = row[1], row[2], row[3]
+
+        # Playlist-mode sentinels
+        if target_path == "_noop":
+            return
+        if target_path == "_playlists":
+            self._view_mode = "playlist-list"
+            self.reload_files()
+            return
+        if target_path == "_back-to-files":
+            self._view_mode = "files"
+            self._playlist_view = None
+            self.current_dir = self.folder
+            self.add_folder_btn.set_sensitive(True)
+            self.shuffle_folder_btn.set_sensitive(True)
+            self.reload_files()
+            return
+        if target_path == "_back-to-playlists":
+            self._view_mode = "playlist-list"
+            self._playlist_view = None
+            self.reload_files()
+            return
+        if target_path.startswith("_playlist:"):
+            self._view_mode = "playlist"
+            self._playlist_view = target_path[len("_playlist:"):]
+            self.reload_files()
+            return
+
         if is_folder:
-            # Navigate into folder (or up, since ".." is also marked is_folder)
             self.current_dir = Path(target_path)
             self.reload_files()
             return
@@ -891,13 +1028,106 @@ class MusicPlayer(Gtk.ApplicationWindow):
         return False
 
     def on_nav_home(self, _btn):
+        self._view_mode = "files"
+        self._playlist_view = None
         self.current_dir = self.folder
+        self.add_folder_btn.set_sensitive(True)
+        self.shuffle_folder_btn.set_sensitive(True)
         self.reload_files()
 
     def on_nav_up(self, _btn):
+        if self._view_mode == "playlist":
+            self._view_mode = "playlist-list"
+            self._playlist_view = None
+            self.reload_files()
+            return
+        if self._view_mode == "playlist-list":
+            self._view_mode = "files"
+            self.current_dir = self.folder
+            self.add_folder_btn.set_sensitive(True)
+            self.shuffle_folder_btn.set_sensitive(True)
+            self.reload_files()
+            return
         if self.current_dir.resolve() != self.folder.resolve():
             self.current_dir = self.current_dir.parent
             self.reload_files()
+
+    def _ask_text(self, title: str, prompt: str, default: str = "") -> str | None:
+        """Modal one-line text prompt. Returns the entered text or None."""
+        dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                        "OK", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_margin_top(10); box.set_margin_bottom(10)
+        box.set_margin_start(12); box.set_margin_end(12)
+        box.set_spacing(6)
+        lbl = Gtk.Label(label=prompt, xalign=0)
+        box.pack_start(lbl, False, False, 0)
+        entry = Gtk.Entry()
+        entry.set_text(default)
+        entry.set_activates_default(True)
+        box.pack_start(entry, False, False, 0)
+        dlg.show_all()
+        result = entry.get_text().strip() if dlg.run() == Gtk.ResponseType.OK else None
+        dlg.destroy()
+        return result or None
+
+    def _ask_confirm(self, title: str, message: str) -> bool:
+        dlg = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=title, secondary_text=message,
+        )
+        ok = dlg.run() == Gtk.ResponseType.OK
+        dlg.destroy()
+        return ok
+
+    def on_save_queue_as_playlist(self, _btn):
+        if not self.queue_paths:
+            self._toast("Queue is empty — nothing to save")
+            return
+        name = self._ask_text(
+            "Save playlist",
+            f"Name for this playlist of {len(self.queue_paths)} tracks:",
+            "My Playlist")
+        if not name:
+            return
+        self._write_playlist(name, self.queue_paths)
+        self._toast(f"saved playlist '{name}' ({len(self.queue_paths)} tracks)")
+        # If user is viewing the playlist list, refresh so they see it
+        if self._view_mode == "playlist-list":
+            self.reload_files()
+
+    def on_delete_current_playlist(self, _btn):
+        name = self._playlist_view
+        if not name:
+            return
+        if not self._ask_confirm(
+                f"Delete playlist '{name}'?",
+                "The audio files are untouched; only the playlist itself is removed."):
+            return
+        if self._delete_playlist(name):
+            self._toast(f"deleted playlist '{name}'")
+        # back to playlist list
+        self._view_mode = "playlist-list"
+        self._playlist_view = None
+        self.reload_files()
+
+    def on_rename_current_playlist(self, _btn):
+        old = self._playlist_view
+        if not old:
+            return
+        new = self._ask_text("Rename playlist", f"New name for '{old}':", old)
+        if not new or new == old:
+            return
+        tracks = self._playlist_tracks(old)
+        self._write_playlist(new, tracks)
+        self._delete_playlist(old)
+        self._playlist_view = self._safe_pl_name(new)
+        self.reload_files()
+        self._toast(f"renamed to '{new}'")
 
     def on_open_in_file_manager(self, _btn):
         target = self.current_dir if self.current_dir.exists() else self.folder
