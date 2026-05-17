@@ -142,14 +142,16 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.cast_btn.connect("clicked", self.on_cast_clicked)
         self.header.pack_end(self.cast_btn)
 
-        # "Cinema mode" — collapses the whole bottom area (browser + queue +
-        # transport) so just the video shows, without going fullscreen.
-        self.controls_hidden = False
-        self.controls_toggle_btn = Gtk.ToggleButton(label="🎬 Hide controls")
-        self.controls_toggle_btn.set_active(False)
+        # View layout — three-state cycle:
+        #   "split"    : video on top, browser/queue/transport below (default)
+        #   "controls" : video hidden, all controls fill the window
+        #   "video"    : controls hidden, video fills the window
+        # Click the button (or Ctrl+Q) to cycle: split → controls → video → split.
+        self._view_layout = "split"
+        self.controls_toggle_btn = Gtk.Button(label="↕ Split view")
         self.controls_toggle_btn.set_tooltip_text(
-            "Hide everything except the video (Ctrl+Q)")
-        self.controls_toggle_btn.connect("toggled", self.on_toggle_controls)
+            "Cycle layout: split → all controls → video only (Ctrl+Q)")
+        self.controls_toggle_btn.connect("clicked", self.on_cycle_layout)
         self.header.pack_end(self.controls_toggle_btn)
 
         self.folder_label = Gtk.Label(label=str(self.folder), ellipsize=3)
@@ -166,7 +168,8 @@ class MusicPlayer(Gtk.ApplicationWindow):
         vpaned = self.vpaned  # local alias for the rest of the UI setup
 
         # Video area
-        video_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.video_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        video_box = self.video_box  # local alias for the rest of UI setup
         style = video_box.get_style_context()
         style.add_class("view")
         css = Gtk.CssProvider()
@@ -462,50 +465,66 @@ class MusicPlayer(Gtk.ApplicationWindow):
         sw.add(child)
         return sw
 
-    def on_toggle_controls(self, btn):
-        self.controls_hidden = btn.get_active()
-        if self.controls_hidden:
-            # Hide everything below the video; keep the header so user can
-            # find the button to bring controls back.
-            self.hpaned.hide()
-            self.transport.hide()
-            self.transport_sep.hide()
-            self.controls_toggle_btn.set_label("◀ Show controls")
-            self.vpaned.set_position(-1)  # give all space to video
-        else:
+    _LAYOUT_LABELS = {
+        "split":    "↕ Split view",
+        "controls": "📋 All controls",
+        "video":    "🎬 Video only",
+    }
+    _LAYOUT_CYCLE = {"split": "controls", "controls": "video", "video": "split"}
+
+    def on_cycle_layout(self, _btn):
+        self._view_layout = self._LAYOUT_CYCLE[self._view_layout]
+        self._apply_layout()
+
+    def _apply_layout(self):
+        """Apply the current in-window layout (called when the user cycles,
+        and also when we exit fullscreen so the prior layout is restored)."""
+        mode = self._view_layout
+        if mode == "split":
+            self.video_box.show()
             self.hpaned.show()
             self.transport.show()
             self.transport_sep.show()
-            self.controls_toggle_btn.set_label("🎬 Hide controls")
-            # restore the split
-            self.vpaned.set_position(max(self.get_allocated_height() // 2, 360))
+            # Restore a sensible split
+            h = self.get_allocated_height()
+            self.vpaned.set_position(max(h // 2 if h > 0 else 360, 360))
+        elif mode == "controls":
+            # Hide the video, let the controls take the whole window
+            self.video_box.hide()
+            self.hpaned.show()
+            self.transport.show()
+            self.transport_sep.show()
+            # Push the split to 0 so the bottom pane gets all available space
+            self.vpaned.set_position(0)
+        else:  # "video"
+            self.video_box.show()
+            self.hpaned.hide()
+            self.transport.hide()
+            self.transport_sep.hide()
+            self.vpaned.set_position(-1)
+        self.controls_toggle_btn.set_label(self._LAYOUT_LABELS[mode])
 
     def toggle_fullscreen(self):
         if self.is_fullscreen:
             self.unfullscreen()
         else:
             self.fullscreen()
-        # the actual show/hide is driven by on_window_state below, so the
-        # state stays consistent whether we toggled here or the WM did.
+        # actual show/hide is driven by on_window_state below
 
     def _apply_fullscreen_layout(self, fs: bool):
-        """Show only the video pane when fullscreen; restore otherwise."""
+        """While fullscreen we always show only the video, ignoring the
+        in-window layout. When fullscreen exits we re-apply whichever
+        in-window layout the user had chosen."""
         if fs:
             self.header.hide()
+            self.video_box.show()
             self.hpaned.hide()
             self.transport.hide()
             self.transport_sep.hide()
-            # let the video take all of vpaned
             self.vpaned.set_position(-1)
         else:
             self.header.show()
-            # respect the user's cinema-mode preference when coming back
-            if not self.controls_hidden:
-                self.hpaned.show()
-                self.transport.show()
-                self.transport_sep.show()
-            # restore a sensible split
-            self.vpaned.set_position(max(self.get_allocated_height() // 2, 360))
+            self._apply_layout()
 
     def on_window_state(self, _w, event):
         fs = bool(event.new_window_state & Gdk.WindowState.FULLSCREEN)
@@ -706,8 +725,7 @@ class MusicPlayer(Gtk.ApplicationWindow):
         if kv == Gdk.KEY_Left and ev.state & Gdk.ModifierType.CONTROL_MASK:
             self.on_prev(None); return True
         if kv == Gdk.KEY_q and ev.state & Gdk.ModifierType.CONTROL_MASK:
-            self.controls_toggle_btn.set_active(
-                not self.controls_toggle_btn.get_active())
+            self.on_cycle_layout(None)
             return True
         return False
 
