@@ -117,7 +117,10 @@ class MusicPlayer(Gtk.ApplicationWindow):
 
         refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
         refresh_btn.set_tooltip_text("Rescan folder")
-        refresh_btn.connect("clicked", lambda *_: self.reload_files())
+        refresh_btn.connect("clicked", lambda *_: (
+            setattr(self, "_search_index", None),  # invalidate search cache
+            self.reload_files(),
+        ))
         self.header.pack_start(refresh_btn)
 
         fs_btn = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
@@ -202,16 +205,39 @@ class MusicPlayer(Gtk.ApplicationWindow):
         nav_row.pack_start(open_fm_btn, False, False, 0)
         left.pack_start(nav_row, False, False, 0)
 
+        # Search box — searches recursively within whatever folder the
+        # browser is currently in. So if you're in /DEAD/Grateful Dead
+        # Archive/ typing "morning dew" only hits GD shows.
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search this folder… (Ctrl+F)")
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        self.search_entry.connect("stop-search",
+            lambda *_: self._exit_search())
+        left.pack_start(self.search_entry, False, False, 0)
+        self._search_mode = False
+        self._search_index: list[Path] | None = None
+        self._search_index_root: Path | None = None  # dir the index was built for
+        self._search_timer = None
+
         # store columns: display, full path, is_folder, is_up_entry
         self.files_store = Gtk.ListStore(str, str, bool, bool)
         self.files_view = Gtk.TreeView(model=self.files_store)
         self.files_view.set_headers_visible(False)
-        self.files_view.append_column(Gtk.TreeViewColumn("Track", Gtk.CellRendererText(), text=0))
+        # set_fixed_height_mode lets GTK skip measuring every row's height —
+        # huge speedup for lists with thousands of items. Requires all
+        # columns to be FIXED-sized.
+        track_col_files = Gtk.TreeViewColumn("Track", Gtk.CellRendererText(), text=0)
+        track_col_files.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        self.files_view.append_column(track_col_files)
+        self.files_view.set_fixed_height_mode(True)
         self.files_view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.files_view.connect("row-activated", self.on_file_activated)
         self.files_view.connect("key-press-event", self.on_files_key)
+        # Coalesce selection-changed bursts (marquee drags fire it hundreds
+        # of times per second) into a single idle callback.
+        self._add_label_pending = False
         self.files_view.get_selection().connect("changed",
-            lambda *_: self._update_add_button_label())
+            lambda *_: self._schedule_add_label_update())
 
         # Custom click-drag selection + drag-out. GTK's built-in
         # set_rubber_banding only works from empty space below rows, and
@@ -233,26 +259,36 @@ class MusicPlayer(Gtk.ApplicationWindow):
         hint.get_style_context().add_class("dim-label")
         left.pack_start(hint, False, False, 0)
 
+        # Row 1: per-selection adds (top / bottom of queue)
         add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         add_row.set_homogeneous(True)
+        self.add_top_btn = Gtk.Button(label="↑ Add to top")
+        self.add_top_btn.set_tooltip_text(
+            "Insert the selected files at the START of the queue (plays next)")
+        self.add_top_btn.connect("clicked", self.on_add_top_clicked)
+        add_row.pack_start(self.add_top_btn, True, True, 0)
+
         self.add_btn = Gtk.Button(label="Add to queue ▶")
-        self.add_btn.set_tooltip_text("Add the selected files to the queue")
+        self.add_btn.set_tooltip_text("Append the selected files to the END of the queue")
         self.add_btn.connect("clicked", self.on_add_clicked)
         add_row.pack_start(self.add_btn, True, True, 0)
+        left.pack_start(add_row, False, False, 0)
 
+        # Row 2: whole-folder adds (only meaningful when not in search mode)
+        folder_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        folder_row.set_homogeneous(True)
         self.add_folder_btn = Gtk.Button(label="Add whole folder ▶")
         self.add_folder_btn.set_tooltip_text(
             "Add every media file in this folder (and subfolders) to the queue")
         self.add_folder_btn.connect("clicked", self.on_add_folder_clicked)
-        add_row.pack_start(self.add_folder_btn, True, True, 0)
+        folder_row.pack_start(self.add_folder_btn, True, True, 0)
 
         self.shuffle_folder_btn = Gtk.Button(label="🔀 Shuffle folder")
         self.shuffle_folder_btn.set_tooltip_text(
             "Add every media file in this folder (and subfolders) in random order")
         self.shuffle_folder_btn.connect("clicked", self.on_shuffle_folder_clicked)
-        add_row.pack_start(self.shuffle_folder_btn, True, True, 0)
-
-        left.pack_start(add_row, False, False, 0)
+        folder_row.pack_start(self.shuffle_folder_btn, True, True, 0)
+        left.pack_start(folder_row, False, False, 0)
         hpaned.pack1(left, True, False)
 
         # Queue
@@ -268,8 +304,12 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.queue_store = Gtk.ListStore(str, str, str)  # marker, display, path
         self.queue_view = Gtk.TreeView(model=self.queue_store)
         self.queue_view.set_headers_visible(False)
-        self.queue_view.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(), text=0))
+        marker_col = Gtk.TreeViewColumn("", Gtk.CellRendererText(), text=0)
+        marker_col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        marker_col.set_fixed_width(28)
+        self.queue_view.append_column(marker_col)
         track_col = Gtk.TreeViewColumn("Track", Gtk.CellRendererText(), text=1)
+        track_col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
         track_col.set_expand(True)
         self.queue_view.append_column(track_col)
         # Per-row delete button (renders a clickable ✕ on the right edge).
@@ -282,6 +322,8 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.del_col.set_fixed_width(36)
         self.del_col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
         self.queue_view.append_column(self.del_col)
+        # fixed-height-mode requires every column to be FIXED-sized (set above)
+        self.queue_view.set_fixed_height_mode(True)
         self.queue_view.connect("row-activated", self.on_queue_activated)
         self.queue_view.connect("button-press-event", self.on_queue_button_press)
         self.queue_view.connect("key-press-event", self.on_queue_key)
@@ -620,6 +662,20 @@ class MusicPlayer(Gtk.ApplicationWindow):
 
     def on_key(self, _w, ev):
         kv = ev.keyval
+        # Ctrl+F: focus the library search box
+        if kv == Gdk.KEY_f and ev.state & Gdk.ModifierType.CONTROL_MASK:
+            self.search_entry.grab_focus()
+            return True
+        # Esc: clear search if focused, else fall through to fullscreen exit
+        if kv == Gdk.KEY_Escape and self._search_mode:
+            self.search_entry.set_text("")
+            self.search_entry.grab_focus()
+            return True
+        # Don't eat keys while the user is typing in the search box —
+        # space etc. need to reach the entry.
+        focus = self.get_focus()
+        if isinstance(focus, Gtk.Entry):
+            return False
         if kv == Gdk.KEY_space:
             self.on_play_pause(None)
             return True
@@ -641,8 +697,8 @@ class MusicPlayer(Gtk.ApplicationWindow):
 
     # --- file list --------------------------------------------------------
     def reload_files(self):
-        self.files_store.clear()
         if not self.folder.exists():
+            self.files_store.clear()
             self.folder_label.set_text(f"{self.folder} (missing)")
             self.path_label.set_text("(folder missing)")
             return
@@ -665,13 +721,21 @@ class MusicPlayer(Gtk.ApplicationWindow):
         folders.sort(key=lambda x: x[0].lower())
         files.sort(key=lambda x: x[0].lower())
 
-        # ".." entry when below root
-        if self.current_dir.resolve() != self.folder.resolve():
-            self.files_store.append(["⬆  ..", str(self.current_dir.parent), True, True])
-        for display, p in folders:
-            self.files_store.append([display, str(p), True, False])
-        for display, p in files:
-            self.files_store.append([display, str(p), False, False])
+        # Detach the model from the view while we rebuild — avoids per-row
+        # redraws and dramatically reduces flicker for big folders.
+        self.files_view.freeze_child_notify()
+        self.files_view.set_model(None)
+        try:
+            self.files_store.clear()
+            if self.current_dir.resolve() != self.folder.resolve():
+                self.files_store.append(["⬆  ..", str(self.current_dir.parent), True, True])
+            for display, p in folders:
+                self.files_store.append([display, str(p), True, False])
+            for display, p in files:
+                self.files_store.append([display, str(p), False, False])
+        finally:
+            self.files_view.set_model(self.files_store)
+            self.files_view.thaw_child_notify()
 
         # Breadcrumb-ish path label
         try:
@@ -793,14 +857,28 @@ class MusicPlayer(Gtk.ApplicationWindow):
         if self.current_index == -1:
             self.play_index(len(self.queue_paths) - 1)
 
-    def _update_add_button_label(self):
+    def _schedule_add_label_update(self):
+        if self._add_label_pending:
+            return
+        self._add_label_pending = True
+        GLib.idle_add(self._do_update_add_label)
+
+    def _do_update_add_label(self):
+        self._add_label_pending = False
         n = len(self.selected_file_paths())
         if n == 0:
-            self.add_btn.set_label("Add to queue ▶")
+            new = "Add to queue ▶"
         elif n == 1:
-            self.add_btn.set_label("Add 1 to queue ▶")
+            new = "Add 1 to queue ▶"
         else:
-            self.add_btn.set_label(f"Add {n} to queue ▶")
+            new = f"Add {n} to queue ▶"
+        if self.add_btn.get_label() != new:
+            self.add_btn.set_label(new)
+        return False  # don't repeat
+
+    # Compatibility wrapper kept in case other code referenced this
+    def _update_add_button_label(self):
+        self._schedule_add_label_update()
 
     def on_files_key(self, view, event):
         if event.keyval == Gdk.KEY_a and event.state & Gdk.ModifierType.CONTROL_MASK:
@@ -839,6 +917,105 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.refresh_queue_view()
         if was_empty:
             self.play_index(start_at)
+
+    def on_add_top_clicked(self, _btn):
+        """Insert selected files at the START of the queue.
+        If something is playing, the new items go right BEFORE it so
+        they play next, and current_index shifts to track the playing
+        song."""
+        chosen = self.selected_file_paths()
+        if not chosen:
+            return
+        if self.current_index == -1:
+            # Nothing playing — insert at index 0 and start
+            self.queue_paths[0:0] = chosen
+            self.refresh_queue_view()
+            self.play_index(0)
+            return
+        # Insert right after the currently-playing track so the next thing
+        # we play is the first new item
+        insert_at = self.current_index + 1
+        self.queue_paths[insert_at:insert_at] = chosen
+        self.refresh_queue_view()
+        self._toast(f"queued next: {len(chosen)} track{'s' if len(chosen) != 1 else ''}")
+
+    # --- library search ---------------------------------------------------
+    def _on_search_changed(self, entry):
+        # Debounce: delay actual search by 250ms so we don't re-filter on
+        # every keystroke for a 96k-file library.
+        if self._search_timer is not None:
+            GLib.source_remove(self._search_timer)
+        text = entry.get_text().strip()
+        if not text:
+            self._search_timer = None
+            self._exit_search()
+            return
+        self._search_timer = GLib.timeout_add(
+            250, lambda: (self._run_search(text), False)[1])
+
+    def _build_search_index(self):
+        """Walk the CURRENT subtree (current_dir) and cache every media
+        file path. Rebuilt when the user navigates into a different
+        folder or hits Refresh."""
+        idx: list[Path] = []
+        root = self.current_dir
+        try:
+            for p in root.rglob("*"):
+                if p.is_file() and p.suffix.lower() in MEDIA_EXTS:
+                    idx.append(p)
+        except (OSError, PermissionError):
+            pass
+        self._search_index = idx
+        self._search_index_root = root
+
+    def _run_search(self, query: str):
+        # Rebuild the index if it's stale (different folder, or never built)
+        if (self._search_index is None
+                or self._search_index_root != self.current_dir):
+            self._build_search_index()
+        q = query.lower()
+        results: list[Path] = []
+        for p in self._search_index:
+            if q in str(p).lower():
+                results.append(p)
+                if len(results) >= 1000:  # cap for UI sanity
+                    break
+        self._show_search_results(results, query)
+
+    def _show_search_results(self, results: list[Path], query: str):
+        self._search_mode = True
+        self.add_folder_btn.set_sensitive(False)
+        self.shuffle_folder_btn.set_sensitive(False)
+        try:
+            scope = "/" + str(self.current_dir.relative_to(self.folder))
+            if scope == "/.":
+                scope = "/"
+        except ValueError:
+            scope = str(self.current_dir)
+        self.path_label.set_text(
+            f"🔎 {len(results)} hit(s) for '{query}' under {scope}")
+        self.files_view.freeze_child_notify()
+        self.files_view.set_model(None)
+        try:
+            self.files_store.clear()
+            base = self.current_dir
+            for p in results:
+                try:
+                    display = f"🎵 {p.relative_to(base)}"
+                except ValueError:
+                    display = f"🎵 {p}"
+                self.files_store.append([display, str(p), False, False])
+        finally:
+            self.files_view.set_model(self.files_store)
+            self.files_view.thaw_child_notify()
+
+    def _exit_search(self):
+        if not self._search_mode and self._search_timer is None:
+            return
+        self._search_mode = False
+        self.add_folder_btn.set_sensitive(True)
+        self.shuffle_folder_btn.set_sensitive(True)
+        self.reload_files()
 
     def _collect_media(self, root: Path) -> list[Path]:
         """Recursively collect media files under `root`, sorted alphabetically."""
@@ -975,7 +1152,9 @@ class MusicPlayer(Gtk.ApplicationWindow):
             self._marquee = None
             return True
 
-        # mode == "marquee": update range-select from anchor to row under cursor
+        # mode == "marquee": update range-select from anchor to row under cursor.
+        # Only act when the row under the cursor actually changes (throttling)
+        # and use select_range (single GTK call) instead of per-row select.
         n = len(self.files_store)
         if n == 0:
             return False
@@ -985,15 +1164,20 @@ class MusicPlayer(Gtk.ApplicationWindow):
         else:
             cur_path, _, _, _ = path_info
             cur_idx = cur_path.get_indices()[0]
+        # Skip work if the row hasn't changed since last update
+        if self._marquee.get("last_idx") == cur_idx:
+            return True
+        self._marquee["last_idx"] = cur_idx
         anchor_idx = self._marquee["a_idx"]
         if anchor_idx is None:
-            anchor_idx = cur_idx  # marquee started in empty space
+            anchor_idx = cur_idx
             self._marquee["a_idx"] = anchor_idx
         lo, hi = (anchor_idx, cur_idx) if anchor_idx <= cur_idx else (cur_idx, anchor_idx)
         sel = view.get_selection()
+        start = Gtk.TreePath.new_from_indices([lo])
+        end = Gtk.TreePath.new_from_indices([hi])
         sel.unselect_all()
-        for i in range(lo, hi + 1):
-            sel.select_path(Gtk.TreePath.new_from_indices([i]))
+        sel.select_range(start, end)
         return True
 
     def _on_files_release(self, view, event):
@@ -1194,17 +1378,25 @@ class MusicPlayer(Gtk.ApplicationWindow):
         self.refresh_queue_view()
 
     def refresh_queue_view(self):
-        self.queue_store.clear()
-        for idx, p in enumerate(self.queue_paths):
-            marker = "▶" if idx == self.current_index else ""
-            rel_display = p.stem
-            try:
-                rel = p.relative_to(self.folder)
-                if rel.parent != Path("."):
-                    rel_display = f"{rel.parent}  /  {p.stem}"
-            except ValueError:
-                pass
-            self.queue_store.append([marker, rel_display, str(p)])
+        # Detach the model while we rebuild — avoids hundreds of intermediate
+        # redraws when the queue has lots of rows.
+        self.queue_view.freeze_child_notify()
+        self.queue_view.set_model(None)
+        try:
+            self.queue_store.clear()
+            for idx, p in enumerate(self.queue_paths):
+                marker = "▶" if idx == self.current_index else ""
+                rel_display = p.stem
+                try:
+                    rel = p.relative_to(self.folder)
+                    if rel.parent != Path("."):
+                        rel_display = f"{rel.parent}  /  {p.stem}"
+                except ValueError:
+                    pass
+                self.queue_store.append([marker, rel_display, str(p)])
+        finally:
+            self.queue_view.set_model(self.queue_store)
+            self.queue_view.thaw_child_notify()
 
     # --- playback ---------------------------------------------------------
     def _set_play_icon(self, playing: bool):
@@ -1218,18 +1410,36 @@ class MusicPlayer(Gtk.ApplicationWindow):
             except Exception as e:
                 sys.stderr.write(f"[musicnode] mpris notify failed: {e}\n")
 
+    def _move_play_marker(self, old_idx: int, new_idx: int):
+        """Update just the ▶ marker on two queue rows in-place, instead of
+        rebuilding the whole queue ListStore. Massive flicker reduction
+        for the most-common operation (track change)."""
+        n = len(self.queue_store)
+        if 0 <= old_idx < n:
+            self.queue_store[old_idx][0] = ""
+        if 0 <= new_idx < n:
+            self.queue_store[new_idx][0] = "▶"
+
     def play_index(self, idx: int):
         if idx < 0 or idx >= len(self.queue_paths):
             return
-        self.player.set_state(Gst.State.NULL)
+        old_idx = self.current_index
+        # READY instead of NULL between tracks — keeps the video sink
+        # warm so we don't get a black-flash on track change.
+        self.player.set_state(Gst.State.READY)
         path = self.queue_paths[idx]
         self.player.set_property("uri", Gio.File.new_for_path(str(path)).get_uri())
         self.player.set_state(Gst.State.PLAYING)
         self.current_index = idx
-        self.now_label.set_text(f"♪ {path.stem}")
-        self.set_title(f"{path.stem} — MusicNode")
+        new_text = f"♪ {path.stem}"
+        if self.now_label.get_text() != new_text:
+            self.now_label.set_text(new_text)
+        new_title = f"{path.stem} — MusicNode"
+        if self.get_title() != new_title:
+            self.set_title(new_title)
         self._set_play_icon(True)
-        self.refresh_queue_view()
+        # In-place marker swap rather than full queue rebuild
+        self._move_play_marker(old_idx, idx)
         # Metadata length isn't known immediately — give it a beat, then
         # re-notify so the lock screen picks up the duration.
         self._notify_mpris("PlaybackStatus", "Metadata")
@@ -1296,10 +1506,18 @@ class MusicPlayer(Gtk.ApplicationWindow):
         ok_d, dur = self.player.query_duration(Gst.Format.TIME)
         ok_p, pos = self.player.query_position(Gst.Format.TIME)
         if ok_d and dur > 0:
-            self.dur_label.set_text(fmt_time(dur))
+            new_dur = fmt_time(dur)
+            if self.dur_label.get_text() != new_dur:
+                self.dur_label.set_text(new_dur)
             if ok_p:
-                self.pos_label.set_text(fmt_time(pos))
-                self.scale.set_value(pos / dur)
+                new_pos = fmt_time(pos)
+                if self.pos_label.get_text() != new_pos:
+                    self.pos_label.set_text(new_pos)
+                # Only nudge the slider if the change is meaningful;
+                # otherwise GTK does a redraw for nothing.
+                new_val = pos / dur
+                if abs(self.scale.get_value() - new_val) > 0.001:
+                    self.scale.set_value(new_val)
         return True
 
     # --- state persistence ------------------------------------------------

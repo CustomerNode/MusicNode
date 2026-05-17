@@ -8,3 +8,4 @@ Terminal=false
 Categories=AudioVideo;Audio;Video;Player;
 Keywords=music;video;queue;audio;player;mp4;airplay;
 StartupNotify=true
+StartupWMClass=Musicnode
