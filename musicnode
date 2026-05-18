@@ -12,6 +12,7 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -38,6 +39,10 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 STATE_PATH = CONFIG_DIR / "state.json"
 PLAYLISTS_DIR = CONFIG_DIR / "playlists"
 DEFAULT_FOLDER = Path.home() / "Music"
+# Cap on how many tracks can be added to the queue in one click. Without
+# this, hitting "Shuffle" on a 46,000-track folder hangs the UI long
+# enough that the window manager force-closes the app.
+QUEUE_ADD_LIMIT = 5000
 MEDIA_EXTS = {
     # video
     ".mp4", ".m4v", ".mkv", ".webm", ".mov", ".avi", ".wmv", ".flv",
@@ -1288,26 +1293,45 @@ class MusicPlayer(Gtk.ApplicationWindow):
         if not chosen_folders:
             chosen_folders = [self.current_dir]
 
-        all_media: list[Path] = []
-        for folder in chosen_folders:
-            all_media.extend(self._collect_media(folder))
+        # rglob over tens of thousands of files on a spinning HDD can take
+        # tens of seconds. Do it on a worker thread so the UI doesn't freeze
+        # and trigger a window-manager force-close.
+        self._toast(f"scanning {len(chosen_folders)} folder(s)…")
 
-        if not all_media:
+        def worker():
+            media: list[Path] = []
+            for folder in chosen_folders:
+                media.extend(self._collect_media(folder))
+            if shuffle:
+                random.shuffle(media)
+            GLib.idle_add(self._finish_folder_add, media, shuffle)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_folder_add(self, media: list[Path], shuffle: bool):
+        """Runs on the main thread after the worker thread finishes scanning."""
+        if not media:
             self._toast("No media files found in that folder")
-            return
-
-        if shuffle:
-            random.shuffle(all_media)
-
+            return False
+        total = len(media)
+        capped = total > QUEUE_ADD_LIMIT
+        if capped:
+            media = media[:QUEUE_ADD_LIMIT]
         was_empty = self.current_index == -1
         start_at = len(self.queue_paths)
-        self.queue_paths.extend(all_media)
+        self.queue_paths.extend(media)
         self.refresh_queue_view()
         if was_empty:
             self.play_index(start_at)
         verb = "shuffled" if shuffle else "added"
-        n = len(all_media)
-        self._toast(f"{verb} {n} file{'s' if n != 1 else ''} to queue")
+        n = len(media)
+        if capped:
+            msg = (f"{verb} {n:,} of {total:,} "
+                   f"(capped at {QUEUE_ADD_LIMIT:,} — too many for one click)")
+        else:
+            msg = f"{verb} {n:,} file{'s' if n != 1 else ''}"
+        self._toast(msg)
+        return False  # don't repeat the idle callback
 
     def on_add_folder_clicked(self, _btn):
         self._add_folder_to_queue(shuffle=False)
